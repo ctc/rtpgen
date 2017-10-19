@@ -263,6 +263,31 @@ int udpSendPacket(const char * packet) {
 	return 1;
 }
 
+void process_packet(void) {
+        int i;
+
+        networkUnixTimestamp = htonll(getUnixTimestamp());
+        networkRtpTimestamp = htonl(getRtpTimestamp(sendRate));
+        networkSequenceNumber = htons(++sequenceNumber); // Sequence number is unique for each packet, while timestamp may remain the same
+        makePacket(packetBuffer);
+        udpSendPacket((const char *)packetBuffer);
+        if (DEBUG) {
+                printf("Packet contents:\n");
+                for (i = 0; i < 80; ++i) {
+                        printf("%2X ", packetBuffer[i]);
+                        if ((i == 16) || (i == 26) || (i == 40) || (i == 54) ||
+                                        (i == 60) || (i == 66) || (i == 70) || (i == 73)) {
+                                printf("\n");
+                        }
+                }
+        }
+}
+
+static void handler(int sig, siginfo_t *si, void *uc) {
+        process_packet();
+}
+
+
 //============================================================================
 int main(int argc, char *argv[]) {
 #ifndef WIN32
@@ -350,31 +375,58 @@ int main(int argc, char *argv[]) {
 	}
 	
 	if (udpInit() == -1) exit(-1);
-    
-	while (1) {
-		networkUnixTimestamp = htonll(getUnixTimestamp());
-        networkRtpTimestamp = htonl(getRtpTimestamp(sendRate));
-		networkSequenceNumber = htons(++sequenceNumber); // Sequence number is unique for each packet, while timestamp may remain the same
-		makePacket(packetBuffer);
-		udpSendPacket((const char *)packetBuffer);
-		if (DEBUG) {
-			printf("Packet contents:\n");
-			for (i = 0; i < 80; ++i) {
-				printf("%2X ", packetBuffer[i]);
-				if ((i == 16) || (i == 26) || (i == 40) || (i == 54) || 
-						(i == 60) || (i == 66) || (i == 70) || (i == 73)) {
-					printf("\n");
-				}
-			}
-		}
 #ifdef WIN32
-		Sleep((1 / sendRate) * 1000);
+        while (1) {
+                process_packet();
+                Sleep((1 / sendRate) * 1000);
+        }
 #else
-        	long long int sleep;
-		sleep = 1000000000 / sendRate;
-		to_sleep.tv_sec = (time_t) (sleep / 1000000000);
-		to_sleep.tv_nsec = (long) (sleep % 1000000000);
-		while ((nanosleep(&to_sleep, &to_sleep) == -1) && (errno == EINTR));
+        timer_t timerid;
+        struct sigevent sev;
+        struct itimerspec its;
+        long long freq_nanosecs;
+        sigset_t mask;
+        struct sigaction sa;
+
+        sa.sa_flags = SA_SIGINFO;
+        sa.sa_sigaction = handler;
+        sigemptyset(&sa.sa_mask);
+        if (sigaction(SIGRTMIN, &sa, NULL) == -1) {
+                printf("failed sigaction\n");
+                exit(-1);
+        }
+        sigemptyset(&mask);
+        sigaddset(&mask, SIGRTMIN);
+        if (sigprocmask(SIG_SETMASK, &mask, NULL) == -1) {
+                printf("failed sigprocmask\n");
+                exit(-1);
+        }
+
+        sev.sigev_notify = SIGEV_SIGNAL;
+        sev.sigev_signo = SIGRTMIN;
+        sev.sigev_value.sival_ptr = &timerid;
+        if (timer_create( CLOCK_REALTIME, &sev, &timerid) == -1) {
+                printf("failed timer_create\n");
+                exit(-1);
+        }
+        if (DEBUG)
+                printf("timer ID is 0x%lx\n", (long) timerid);
+        freq_nanosecs = 1000000000 / sendRate;
+        its.it_value.tv_sec = freq_nanosecs / 1000000000;
+        its.it_value.tv_nsec = freq_nanosecs % 1000000000;
+        its.it_interval.tv_sec = its.it_value.tv_sec;
+        its.it_interval.tv_nsec = its.it_value.tv_nsec;
+        if (timer_settime(timerid, 0, &its, NULL) == -1) {
+                printf("failed timer_settime\n");
+                exit(-1);
+        }
+        if (DEBUG)
+                printf("Unblocking signal %d\n", SIGRTMIN);
+        if (sigprocmask(SIG_UNBLOCK, &mask, NULL) == -1) {
+                printf("failed sigprocmask\n");
+                exit(-1);
+        }
+
+	while(1);
 #endif
-	}
 }
